@@ -14,7 +14,7 @@ import json
 import random
 import time
 from pathlib import Path
-
+import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -97,6 +97,11 @@ def get_args_parser():
     parser.add_argument('--set_cost_giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
 
+    # * SW
+    parser.add_argument('--swas', dest='swas', action='store_true',
+                        help="Use SW Loss")
+    parser.add_argument('--swas_loss_coef', default=1, type=float)
+
     # * Loss coefficients
     parser.add_argument('--mask_loss_coef', default=1, type=float)
     parser.add_argument('--dice_loss_coef', default=1, type=float)
@@ -143,6 +148,7 @@ def main(args):
     random.seed(seed)
 
     model, criterion, postprocessors = build_model(args)
+
     model.to(device)
 
     model_without_ddp = model
@@ -237,6 +243,7 @@ def main(args):
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
+        # assert(0)
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -256,15 +263,16 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
         if not args.eval:
-            test_stats, coco_evaluator = evaluate(
+            test_stats, coco_evaluator, _ = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
     
     if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
+        test_stats, coco_evaluator, det_res  = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+            utils.viz_results(det_res, os.path.join(output_dir,'viz','test'))
         return
 
     print("Start training")
@@ -289,7 +297,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        test_stats, coco_evaluator = evaluate(
+        test_stats, coco_evaluator, det_res = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
         )
 
@@ -312,6 +320,7 @@ def main(args):
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
+                    utils.viz_results(det_res, os.path.join(output_dir,'viz','valid','{:03}'.format(epoch)))
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

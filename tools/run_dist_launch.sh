@@ -20,6 +20,7 @@ NODE_RANK=${NODE_RANK:-0}
 
 let "NNODES=GPUS/GPUS_PER_NODE"
 
+conda activate ddetr
 python ./tools/launch.py \
     --nnodes ${NNODES} \
     --node_rank ${NODE_RANK} \

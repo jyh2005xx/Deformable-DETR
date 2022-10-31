@@ -40,6 +40,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
         outputs = model(samples)
+
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -80,7 +81,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, max_viz_size = 20):
     model.eval()
     criterion.eval()
 
@@ -99,7 +100,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             data_loader.dataset.ann_folder,
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
-
+    viz_res = {}
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -125,6 +126,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
@@ -137,7 +139,18 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 res_pano[i]["file_name"] = file_name
 
             panoptic_evaluator.update(res_pano)
+        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
 
+        results = postprocessors['bbox'](outputs, torch.ones(orig_target_sizes.shape,device=orig_target_sizes.device),raw_output=True)
+        if len(list(viz_res.keys()))<max_viz_size:
+            # import IPython
+            # IPython.embed()
+            # assert(0)
+            tmp_res = {target['image_id'].item(): { **output, **{'image':sample}, **{'size':target['size']},**{'gt_boxes':target['boxes'],'gt_labels':target['labels']}} for target, output, sample in zip(targets, results, samples.tensors)}
+            viz_res.update(tmp_res)
+        # import IPython
+        # IPython.embed()
+        # assert(0)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -163,4 +176,5 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]
         stats['PQ_st'] = panoptic_res["Stuff"]
-    return stats, coco_evaluator
+    
+    return stats, coco_evaluator, viz_res

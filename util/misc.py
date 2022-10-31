@@ -19,44 +19,50 @@ from collections import defaultdict, deque
 import datetime
 import pickle
 from typing import Optional, List
+import os
+import json 
+from PIL import Image, ImageDraw, ImageFont
+
+import numpy as np 
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch import Tensor
 
+
 # needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if float(torchvision.__version__[:3]) < 0.5:
-    import math
-    from torchvision.ops.misc import _NewEmptyTensorOp
-    def _check_size_scale_factor(dim, size, scale_factor):
-        # type: (int, Optional[List[int]], Optional[float]) -> None
-        if size is None and scale_factor is None:
-            raise ValueError("either size or scale_factor should be defined")
-        if size is not None and scale_factor is not None:
-            raise ValueError("only one of size or scale_factor should be defined")
-        if not (scale_factor is not None and len(scale_factor) != dim):
-            raise ValueError(
-                "scale_factor shape must match input shape. "
-                "Input is {}D, scale_factor size is {}".format(dim, len(scale_factor))
-            )
-    def _output_size(dim, input, size, scale_factor):
-        # type: (int, Tensor, Optional[List[int]], Optional[float]) -> List[int]
-        assert dim == 2
-        _check_size_scale_factor(dim, size, scale_factor)
-        if size is not None:
-            return size
-        # if dim is not 2 or scale_factor is iterable use _ntuple instead of concat
-        assert scale_factor is not None and isinstance(scale_factor, (int, float))
-        scale_factors = [scale_factor, scale_factor]
-        # math.floor might return float in py2.7
-        return [
-            int(math.floor(input.size(i + 2) * scale_factors[i])) for i in range(dim)
-        ]
-elif float(torchvision.__version__[:3]) < 0.7:
-    from torchvision.ops import _new_empty_tensor
-    from torchvision.ops.misc import _output_size
+# if float(torchvision.__version__[:3]) < 0.5:
+#     import math
+#     from torchvision.ops.misc import _NewEmptyTensorOp
+#     def _check_size_scale_factor(dim, size, scale_factor):
+#         # type: (int, Optional[List[int]], Optional[float]) -> None
+#         if size is None and scale_factor is None:
+#             raise ValueError("either size or scale_factor should be defined")
+#         if size is not None and scale_factor is not None:
+#             raise ValueError("only one of size or scale_factor should be defined")
+#         if not (scale_factor is not None and len(scale_factor) != dim):
+#             raise ValueError(
+#                 "scale_factor shape must match input shape. "
+#                 "Input is {}D, scale_factor size is {}".format(dim, len(scale_factor))
+#             )
+#     def _output_size(dim, input, size, scale_factor):
+#         # type: (int, Tensor, Optional[List[int]], Optional[float]) -> List[int]
+#         assert dim == 2
+#         _check_size_scale_factor(dim, size, scale_factor)
+#         if size is not None:
+#             return size
+#         # if dim is not 2 or scale_factor is iterable use _ntuple instead of concat
+#         assert scale_factor is not None and isinstance(scale_factor, (int, float))
+#         scale_factors = [scale_factor, scale_factor]
+#         # math.floor might return float in py2.7
+#         return [
+#             int(math.floor(input.size(i + 2) * scale_factors[i])) for i in range(dim)
+#         ]
+# elif float(torchvision.__version__[:3]) < 0.7:
+#     from torchvision.ops import _new_empty_tensor
+#     from torchvision.ops.misc import _output_size
 
 
 class SmoothedValue(object):
@@ -457,9 +463,11 @@ def init_distributed_mode(args):
         args.rank, args.dist_url), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                          world_size=args.world_size, rank=args.rank)
+    print('L460')
     torch.distributed.barrier()
+    print('L462')
     setup_for_distributed(args.rank == 0)
-
+    print('L463')
 
 @torch.no_grad()
 def accuracy(output, target, topk=(1,)):
@@ -487,19 +495,20 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
-        if input.numel() > 0:
-            return torch.nn.functional.interpolate(
-                input, size, scale_factor, mode, align_corners
-            )
+    # if float(torchvision.__version__[:3]) < 0.7:
+    #     if input.numel() > 0:
+    #         return torch.nn.functional.interpolate(
+    #             input, size, scale_factor, mode, align_corners
+    #         )
 
-        output_shape = _output_size(2, input, size, scale_factor)
-        output_shape = list(input.shape[:-2]) + list(output_shape)
-        if float(torchvision.__version__[:3]) < 0.5:
-            return _NewEmptyTensorOp.apply(input, output_shape)
-        return _new_empty_tensor(input, output_shape)
-    else:
-        return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+    #     output_shape = _output_size(2, input, size, scale_factor)
+    #     output_shape = list(input.shape[:-2]) + list(output_shape)
+    #     if float(torchvision.__version__[:3]) < 0.5:
+    #         return _NewEmptyTensorOp.apply(input, output_shape)
+    #     return _new_empty_tensor(input, output_shape)
+    # else:
+    #     return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+    return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
 
 
 def get_total_grad_norm(parameters, norm_type=2):
@@ -516,3 +525,64 @@ def inverse_sigmoid(x, eps=1e-5):
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1/x2)
 
+
+def viz_results(det_res, viz_path,num_bbox = 5):
+    CLASSES = [
+        'N/A', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+        'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A',
+        'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse',
+        'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'N/A', 'backpack',
+        'umbrella', 'N/A', 'N/A', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis',
+        'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'N/A', 'wine glass',
+        'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich',
+        'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+        'chair', 'couch', 'potted plant', 'bed', 'N/A', 'dining table', 'N/A',
+        'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
+        'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A',
+        'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+        'toothbrush'
+    ]
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    if not os.path.exists(viz_path):
+        os.makedirs(viz_path)
+    for k,v in det_res.items():
+        img = torch.permute(v['image'],(1,2,0)).cpu().numpy()*std+mean
+        H,W,_ = img.shape
+        fnt = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 28, encoding="unic")
+        img = Image.fromarray(np.uint8(img*255), 'RGB')
+        draw = ImageDraw.Draw(img)
+        # import IPython
+        # IPython.embed()
+        # assert(0)
+        for i in range(num_bbox):
+            bbox = v['boxes'][i].cpu().numpy()
+            bbox[[0,2]] = bbox[[0,2]] * v['size'].cpu().numpy()[1]
+            bbox[[1,3]] = bbox[[1,3]] * v['size'].cpu().numpy()[0]
+
+            label = CLASSES[v['labels'][i].cpu().numpy().item()]
+            color = (0,255, 0)
+            draw.rectangle(bbox.tolist(), width = 5,outline=color, fill=None)
+            draw.text((bbox[0]+5, bbox[1]+5), label, fill=color, font=fnt)
+        for bbox,label in zip(v['gt_boxes'],v['gt_labels']):
+            bbox = bbox.cpu().numpy()
+            bbox[[0,2]] = bbox[[0,2]] * v['size'].cpu().numpy()[1]
+            bbox[[1,3]] = bbox[[1,3]] * v['size'].cpu().numpy()[0]
+            bbox[0] = bbox[0] - bbox[2]/2
+            bbox[2] = bbox[0] + bbox[2]
+            bbox[1] = bbox[1] - bbox[3]/2
+            bbox[3] = bbox[1] + bbox[3]
+            label = CLASSES[label.cpu().numpy().item()]
+            color = (255,0, 0)
+            draw.rectangle(bbox.tolist(), width = 5,outline=color, fill=None)
+            draw.text((bbox[0]+5, bbox[1]+5), label, fill=color, font=fnt)
+        img.save(os.path.join(viz_path,'{:03}.jpg'.format(k)))
+        tmp_dict = {'img_name':k,'bbox':v['boxes'].cpu().numpy().tolist() ,'scores':v['scores'].cpu().numpy().tolist() ,'labels':v['labels'].cpu().numpy().tolist(),'raw_prob':v['raw_prob'].cpu().numpy().tolist() ,'raw_bbox':v['raw_bbox'].cpu().numpy().tolist()  }
+
+        with open(os.path.join(viz_path,'{:03}.json'.format(k)), "w") as outfile:
+                json.dump( tmp_dict, outfile)
+        # import IPython
+        # IPython.embed()
+        # assert(0)
+    return 

@@ -216,6 +216,9 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        
+        self.num_projection = 5000
+        self.rand_bbox = True
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -256,6 +259,85 @@ class SetCriterion(nn.Module):
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
+    
+    def box2grid(self,boxes):
+        B,_ = boxes.shape
+        num_pt = 6
+        boxes_x0 = boxes[:,[0]] - boxes[:,[2]]/2
+        boxes_y0 = boxes[:,[1]] - boxes[:,[3]]/2
+        interval = torch.arange(0,num_pt,device=boxes.device) / (num_pt-1)
+        boxes_x = boxes_x0 + interval* boxes[:,[2]]
+        boxes_y = boxes_y0 + interval* boxes[:,[3]]
+        grid = torch.stack([boxes_x.unsqueeze(-1).repeat(1,1,num_pt),boxes_y.unsqueeze(-2).repeat(1,num_pt,1)],dim=-1).view(B,-1)
+        return grid
+
+    def loss_swas(self,outputs,targets, indices, num_boxes, log=True):
+        # prepare input to sw loss
+        # N by M by 4+num_classess
+
+        B, N, _ = outputs['pred_boxes'].shape
+        pre_grid = self.box2grid(outputs['pred_boxes'].view(-1,4)).view(B,N,-1)
+        _, _, N_B = pre_grid.shape
+        pre_sw = torch.cat((pre_grid,outputs['pred_logits']),2)
+
+        with torch.no_grad():
+            gt_cls = torch.zeros(outputs['pred_logits'].shape,device = pre_sw.device)
+            gt_box = torch.zeros(B,N,4,device = pre_sw.device)
+            if self.rand_bbox:
+                gt_box[:,:,2:4] = torch.rand(pre_sw.shape[0],pre_sw.shape[1],2,device=pre_sw.device)*0.6+0.1
+                gt_box[:,:,:2] = (1-gt_box[:,:,2:4])*torch.rand(pre_sw.shape[0],pre_sw.shape[1],2,device=pre_sw.device)+gt_box[:,:,2:4]/2
+                # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
+                # gt_box[:,:,:4] = box_ops.box_cxcywh_to_xyxy(gt_box[:,:,:4]) - 0.5
+            else:
+                gt_box[:,:,:2] = 0
+                gt_box[:,:,:2] = 0.5
+                # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
+                # gt_box[:,:,:4] = 0
+            
+            for idx in range(len(targets)):
+                _n = targets[idx]['labels'].shape[0]
+                gt_box[idx,:_n,:4] = targets[idx]['boxes']
+                # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
+                # gt_box[idx,:_n,:2] = box_ops.box_cxcywh_to_xyxy(gt_box[idx,:_n,:2])-0.5
+                gt_cls[idx,:_n] = F.one_hot(targets[idx]['labels'],self.num_classes)
+            gt_grid = self.box2grid(gt_box.view(-1,4)).view(B,N,-1)
+            # range to -0.5,+0.5    
+            # gt_grid = self.box2grid(gt_box.view(-1,4)).view(B,N,-1) - 0.5
+            gt_sw = torch.cat([gt_grid,gt_cls],dim=-1)
+
+        with torch.no_grad():
+            lose_sw_bbox = self.sw_loss(pre_sw[:,:,:N_B],gt_sw[:,:,:N_B])
+            lose_sw_class = self.sw_loss(pre_sw[:,:,N_B:],gt_sw[:,:,N_B:])
+        if True:
+
+            lose_sw = self.sw_loss(pre_sw,gt_sw)
+            # print('--------Predict---------')
+            # print(pre_sw[0,:10,:20])
+            # print('-----------GT-----------')
+            # print(gt_sw[0,:10,:20])
+        else:
+            lose_sw = self.sw_loss(pre_sw[:,:,:4],gt_sw[:,:,:4])
+        losses = {'loss_swas': lose_sw,'lose_sw_bbox': lose_sw_bbox,'lose_sw_class': lose_sw_class, 'class_error':torch.zeros(1,device=lose_sw.device)-1}
+        return losses
+
+    def sw_loss(self, dist_1,dist_2):
+        # normlize
+        dist_1 = F.normalize(dist_1, dim=-1, p=2)
+        dist_2 = F.normalize(dist_2, dim=-1, p=2)
+        latent_channel = dist_1.shape[-1]
+        # generate random projection
+        theta = torch.nn.functional.normalize(torch.randn((latent_channel, self.num_projection),device=dist_1.device,requires_grad=False), dim=0, p=2)
+        # project to 1D
+        dist_1 = dist_1@theta
+        dist_2 = dist_2@theta
+        # sort
+        dist_1, _ = torch.sort(dist_1,1)
+        dist_2, _ = torch.sort(dist_2,1)
+        # L2 wasserstein distance
+        w_dist = torch.mean(torch.sum(torch.pow((dist_1-dist_2),2),dim=1),dim=-1)
+        # average distance
+        errG = torch.mean(w_dist,dim=0,keepdim=True)
+        return errG
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -324,7 +406,8 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+             'swas':self.loss_swas
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -339,6 +422,10 @@ class SetCriterion(nn.Module):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
+        if 'swas' in self.losses:
+            indices = None
+        else:
+            indices = self.matcher(outputs_without_aux, targets)
         indices = self.matcher(outputs_without_aux, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
@@ -395,7 +482,7 @@ class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
 
     @torch.no_grad()
-    def forward(self, outputs, target_sizes):
+    def forward(self, outputs, target_sizes, debug=False, raw_output=False):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
@@ -404,11 +491,14 @@ class PostProcess(nn.Module):
                           For visualization, this should be the image size after data augment, but before padding
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
-
+        
+        # !!!!!!!!!!!!!!!! -0.5,+0.5
+        # out_bbox[:,:,:2] = out_bbox[:,:,:2] + 0.5
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
 
         prob = out_logits.sigmoid()
+
         topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), 100, dim=1)
         scores = topk_values
         topk_boxes = topk_indexes // out_logits.shape[2]
@@ -421,8 +511,15 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        if not raw_output:
+            results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        else:
+            results = [{'scores': s, 'labels': l, 'boxes': b, 'raw_bbox': raw_b, 'raw_prob': raw_p} for s, l, b, raw_b, raw_p in zip(scores, labels, boxes, out_bbox, out_logits)]
 
+        if debug:
+            import IPython
+            IPython.embed()
+            assert(0)
         return results
 
 
@@ -446,9 +543,7 @@ def build(args):
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
     device = torch.device(args.device)
-
     backbone = build_backbone(args)
-
     transformer = build_deforamble_transformer(args)
     model = DeformableDETR(
         backbone,
@@ -463,8 +558,12 @@ def build(args):
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    if args.swas:
+        weight_dict = {'loss_swas': 1}
+    else:
+        weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
+        weight_dict['loss_giou'] = args.giou_loss_coef
+
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
@@ -475,11 +574,14 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-
-    losses = ['labels', 'boxes', 'cardinality']
+    if args.swas:
+        losses=['swas']
+    else:
+        losses = ['labels', 'boxes', 'cardinality']
     if args.masks:
         losses += ["masks"]
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25
+
     criterion = SetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
@@ -488,5 +590,4 @@ def build(args):
         if args.dataset_file == "coco_panoptic":
             is_thing_map = {i: i <= 90 for i in range(201)}
             postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
-
     return model, criterion, postprocessors
