@@ -35,7 +35,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, non_obj_class=False, num_bbox_dim=4):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -48,11 +48,12 @@ class DeformableDETR(nn.Module):
             two_stage: two-stage Deformable DETR
         """
         super().__init__()
+        self.non_obj_class = non_obj_class
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
-        self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.bbox_embed = MLP(hidden_dim, hidden_dim, num_bbox_dim, 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
@@ -180,7 +181,10 @@ class DeformableDETR(nn.Module):
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
-
+        # import IPython
+        # IPython.embed()
+        # assert(0)
+        
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
@@ -194,6 +198,22 @@ class DeformableDETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
+class NerfPositionalEncoding(nn.Module):
+    def __init__(self, depth=10, sine_type='lin_sine'):
+        '''
+        out_dim = in_dim * depth * 2
+        '''
+        super().__init__()
+        if sine_type == 'lin_sine':
+            self.bases = [i+1 for i in range(depth)]
+        elif sine_type == 'exp_sine':
+            self.bases = [2**i for i in range(depth)]
+        print(f'using {sine_type} as positional encoding')
+
+    def forward(self, inputs):
+        out = torch.cat([torch.sin(i * math.pi * inputs) for i in self.bases] + [torch.cos(i * math.pi * inputs) for i in self.bases], axis=-1)
+        assert torch.isnan(out).any() == False
+        return out
 
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -201,7 +221,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, losses, focal_alpha=0.25):
+    def __init__(self, num_classes, matcher, weight_dict, losses, focal_alpha=0.25, non_obj_class= False, bbox_embedding='grid'):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -219,7 +239,10 @@ class SetCriterion(nn.Module):
         
         self.num_projection = 5000
         self.rand_bbox = True
-
+        self.non_obj_class = non_obj_class
+        self.bbox_embedding = bbox_embedding
+        if self.bbox_embedding == 'pos_encoding' or self.bbox_embedding == 'pos_decoding':
+            self.pos_encoder = NerfPositionalEncoding(10)
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -276,15 +299,35 @@ class SetCriterion(nn.Module):
         # N by M by 4+num_classess
 
         B, N, _ = outputs['pred_boxes'].shape
-        pre_grid = self.box2grid(outputs['pred_boxes'].view(-1,4)).view(B,N,-1)
+        
+        # prepare bbox for sw loss
+        if self.bbox_embedding == 'pos_encoding':
+            pre_grid = self.pos_encoder(outputs['pred_boxes']).view(B,N,-1)
+        elif self.bbox_embedding == 'pos_decoding':
+            pre_grid = outputs['pred_boxes']
+        elif self.bbox_embedding == 'grid':
+            pre_grid = self.box2grid(outputs['pred_boxes'].view(-1,4)).view(B,N,-1)
+        
         _, _, N_B = pre_grid.shape
-        pre_sw = torch.cat((pre_grid,outputs['pred_logits']),2)
+        
+        # prepare class prob for sw loss
+        if not self.non_obj_class:
+            pred_logits = (outputs['pred_logits']).sigmoid()
+        else:
+            pred_logits = nn.Softmax(dim=2)(outputs['pred_logits'])
 
+        # concat bbox and class prob
+        pre_sw = torch.cat((pre_grid,pred_logits),2)
+        
+        # prepare ground truth
         with torch.no_grad():
-            gt_cls = torch.zeros(outputs['pred_logits'].shape,device = pre_sw.device)
+            # generate random bbox
             gt_box = torch.zeros(B,N,4,device = pre_sw.device)
             if self.rand_bbox:
+                # bbox is in xywh format, value is between 0 and 1 
+                # random x and h between 0.1 and 0.7
                 gt_box[:,:,2:4] = torch.rand(pre_sw.shape[0],pre_sw.shape[1],2,device=pre_sw.device)*0.6+0.1
+                # random center to make sure bbox with in image
                 gt_box[:,:,:2] = (1-gt_box[:,:,2:4])*torch.rand(pre_sw.shape[0],pre_sw.shape[1],2,device=pre_sw.device)+gt_box[:,:,2:4]/2
                 # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
                 # gt_box[:,:,:4] = box_ops.box_cxcywh_to_xyxy(gt_box[:,:,:4]) - 0.5
@@ -293,30 +336,50 @@ class SetCriterion(nn.Module):
                 gt_box[:,:,:2] = 0.5
                 # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
                 # gt_box[:,:,:4] = 0
-            
+
+            # generate class prob holder
+            gt_cls = torch.zeros(outputs['pred_logits'].shape,device = pre_sw.device)
+            if self.non_obj_class:
+                gt_cls[:,:,-1]=1   
+
+            # fill in gt        
             for idx in range(len(targets)):
                 _n = targets[idx]['labels'].shape[0]
                 gt_box[idx,:_n,:4] = targets[idx]['boxes']
-                # !!!!!!!!!!!!!!!! change to corner and range to -0.5,+0.5
-                # gt_box[idx,:_n,:2] = box_ops.box_cxcywh_to_xyxy(gt_box[idx,:_n,:2])-0.5
                 gt_cls[idx,:_n] = F.one_hot(targets[idx]['labels'],self.num_classes)
-            gt_grid = self.box2grid(gt_box.view(-1,4)).view(B,N,-1)
-            # range to -0.5,+0.5    
-            # gt_grid = self.box2grid(gt_box.view(-1,4)).view(B,N,-1) - 0.5
+            
+            # reparameterize gt box
+            if self.bbox_embedding == 'pos_encoding':
+                gt_grid = self.pos_encoder.forward(gt_box).view(B,N,-1)
+            elif self.bbox_embedding == 'pos_decoding':
+                gt_grid = self.pos_encoder.forward(gt_box-0.5).view(B,N,-1)
+            elif self.bbox_embedding == 'grid':
+                gt_grid = self.box2grid(gt_box.view(-1,4)).view(B,N,-1)
+            else:
+                print('non defined bbox embedding')
+                assert(0)
+            
+            # concat bbox and class
             gt_sw = torch.cat([gt_grid,gt_cls],dim=-1)
 
         with torch.no_grad():
             lose_sw_bbox = self.sw_loss(pre_sw[:,:,:N_B],gt_sw[:,:,:N_B])
             lose_sw_class = self.sw_loss(pre_sw[:,:,N_B:],gt_sw[:,:,N_B:])
         if True:
-
-            lose_sw = self.sw_loss(pre_sw,gt_sw)
+            if self.bbox_embedding == 'grid':
+                lose_sw = self.sw_loss(pre_sw-0.5,gt_sw-0.5)
+            else:
+                pre_sw[:,:,N_B:] = pre_sw[:,:,N_B:] -0.5
+                gt_sw[:,:,N_B:] = gt_sw[:,:,N_B:] -0.5
+                pre_sw[:,:,:N_B] = pre_sw[:,:,:N_B] /2
+                gt_sw[:,:,:N_B] = gt_sw[:,:,:N_B] /2
+                lose_sw = self.sw_loss(pre_sw,gt_sw)
             # print('--------Predict---------')
             # print(pre_sw[0,:10,:20])
             # print('-----------GT-----------')
             # print(gt_sw[0,:10,:20])
         else:
-            lose_sw = self.sw_loss(pre_sw[:,:,:4],gt_sw[:,:,:4])
+            lose_sw = self.sw_loss(pre_sw[:,:,:N_B],gt_sw[:,:,:N_B])
         losses = {'loss_swas': lose_sw,'lose_sw_bbox': lose_sw_bbox,'lose_sw_class': lose_sw_class, 'class_error':torch.zeros(1,device=lose_sw.device)-1}
         return losses
 
@@ -426,7 +489,6 @@ class SetCriterion(nn.Module):
             indices = None
         else:
             indices = self.matcher(outputs_without_aux, targets)
-        indices = self.matcher(outputs_without_aux, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -444,7 +506,10 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets)
+                if 'swas' in self.losses:
+                    indices = None
+                else:
+                    indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
@@ -462,7 +527,12 @@ class SetCriterion(nn.Module):
             bin_targets = copy.deepcopy(targets)
             for bt in bin_targets:
                 bt['labels'] = torch.zeros_like(bt['labels'])
-            indices = self.matcher(enc_outputs, bin_targets)
+            
+            if 'swas' in self.losses:
+                indices = None
+            else:
+                indices = self.matcher(enc_outputs, bin_targets)
+            
             for loss in self.losses:
                 if loss == 'masks':
                     # Intermediate masks losses are too costly to compute, we ignore them.
@@ -480,6 +550,10 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
+    def __init__(self, non_obj_class, bbox_embedding ):
+        super().__init__()
+        self.non_obj_class = non_obj_class
+        self.bbox_embedding = bbox_embedding
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes, debug=False, raw_output=False):
@@ -496,10 +570,22 @@ class PostProcess(nn.Module):
         # out_bbox[:,:,:2] = out_bbox[:,:,:2] + 0.5
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
-
-        prob = out_logits.sigmoid()
-
-        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), 100, dim=1)
+        if self.non_obj_class:
+            out_logits = nn.Softmax(dim=3)(out_logits)
+        else:
+            out_logits = out_logits.sigmoid()
+        if self.bbox_embedding == 'pos_decoding':
+            B,K,D = out_bbox.shape
+            xs = out_bbox[:,:,:D//4]
+            ys = out_bbox[:,:,D//4:D//2]
+            ws = out_bbox[:,:,D//2:D//4*3]
+            hs = out_bbox[:,:,D//4*3:]
+            out_bbox = torch.zeros(B,K,4,device=out_bbox.device)
+            out_bbox[:,:,0] = torch.asin(xs[:,:,0])+0.5
+            out_bbox[:,:,1] = torch.asin(ys[:,:,0])+0.5
+            out_bbox[:,:,2] = torch.asin(ws[:,:,0])+0.5
+            out_bbox[:,:,3] = torch.asin(hs[:,:,0])+0.5
+        topk_values, topk_indexes = torch.topk(out_logits.view(out_logits.shape[0], -1), 100, dim=1)
         scores = topk_values
         topk_boxes = topk_indexes // out_logits.shape[2]
         labels = topk_indexes % out_logits.shape[2]
@@ -542,6 +628,8 @@ def build(args):
     num_classes = 20 if args.dataset_file != 'coco' else 91
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
+    if args.non_obj_class:
+        num_classes = num_classes + 1
     device = torch.device(args.device)
     backbone = build_backbone(args)
     transformer = build_deforamble_transformer(args)
@@ -554,7 +642,10 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        non_obj_class = args.non_obj_class,
+        num_bbox_dim = args.num_bbox_dim
     )
+
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
@@ -582,9 +673,9 @@ def build(args):
         losses += ["masks"]
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25
 
-    criterion = SetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha)
+    criterion = SetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha,non_obj_class = args.non_obj_class, bbox_embedding = args.bbox_embedding)
     criterion.to(device)
-    postprocessors = {'bbox': PostProcess()}
+    postprocessors = {'bbox': PostProcess(args.non_obj_class, args.bbox_embedding)}
     if args.masks:
         postprocessors['segm'] = PostProcessSegm()
         if args.dataset_file == "coco_panoptic":

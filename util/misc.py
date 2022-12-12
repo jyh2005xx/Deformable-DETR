@@ -526,7 +526,7 @@ def inverse_sigmoid(x, eps=1e-5):
     return torch.log(x1/x2)
 
 
-def viz_results(det_res, viz_path,num_bbox = 5):
+def viz_results(det_res, viz_path,num_bbox = 10):
     CLASSES = [
         'N/A', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
         'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'N/A',
@@ -541,7 +541,7 @@ def viz_results(det_res, viz_path,num_bbox = 5):
         'N/A', 'toilet', 'N/A', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
         'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'N/A',
         'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
-        'toothbrush'
+        'toothbrush','non_object'
     ]
     mean = np.array([0.485, 0.456, 0.406])
     std = np.array([0.229, 0.224, 0.225])
@@ -553,9 +553,6 @@ def viz_results(det_res, viz_path,num_bbox = 5):
         fnt = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 28, encoding="unic")
         img = Image.fromarray(np.uint8(img*255), 'RGB')
         draw = ImageDraw.Draw(img)
-        # import IPython
-        # IPython.embed()
-        # assert(0)
         for i in range(num_bbox):
             bbox = v['boxes'][i].cpu().numpy()
             bbox[[0,2]] = bbox[[0,2]] * v['size'].cpu().numpy()[1]
@@ -564,7 +561,7 @@ def viz_results(det_res, viz_path,num_bbox = 5):
             label = CLASSES[v['labels'][i].cpu().numpy().item()]
             color = (0,255, 0)
             draw.rectangle(bbox.tolist(), width = 5,outline=color, fill=None)
-            draw.text((bbox[0]+5, bbox[1]+5), label, fill=color, font=fnt)
+            draw.text((bbox[0]+5, bbox[1]+5), '{} {:.02f}'.format(label,v['scores'][i]), fill=color, font=fnt)
         for bbox,label in zip(v['gt_boxes'],v['gt_labels']):
             bbox = bbox.cpu().numpy()
             bbox[[0,2]] = bbox[[0,2]] * v['size'].cpu().numpy()[1]

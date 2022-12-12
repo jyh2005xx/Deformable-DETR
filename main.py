@@ -35,7 +35,7 @@ def get_args_parser():
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
@@ -128,6 +128,10 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
+    parser.add_argument('--non_obj_class', dest='non_obj_class', action='store_true')
+
+    parser.add_argument('--num_bbox_dim', default=4, type=int)
+    parser.add_argument('--bbox_embedding', default='grid', type=str)
     return parser
 
 
@@ -263,10 +267,12 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
         if not args.eval:
-            test_stats, coco_evaluator, _ = evaluate(
+            test_stats, coco_evaluator, det_res = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
-    
+            if args.output_dir:
+                utils.viz_results(det_res, os.path.join(output_dir,'viz','resume_check'))
+
     if args.eval:
         test_stats, coco_evaluator, det_res  = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
